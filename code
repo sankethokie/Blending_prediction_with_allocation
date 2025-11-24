@@ -1,0 +1,271 @@
+pip install pandas numpy scikit-learn pulp
+
+"""
+Blending Prediction & Allocation Modeling for Educational Development Goals
+Patched Version — Office-Laptop-Safe
+No spaCy, No nltk, No huggingface, No deprecated sklearn APIs
+"""
+
+import random
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import pulp
+import json
+import os
+
+RNG = np.random.default_rng(42)
+random.seed(42)
+np.random.seed(42)
+
+# ---------------------------------------------------
+# 1. SYNTHETIC DATA GENERATION
+# ---------------------------------------------------
+def generate_synthetic_population(n_schools=200):
+    regions = ['North','South','East','West']
+    data = []
+    for i in range(n_schools):
+        school_id = f"S{i+1:03d}"
+        region = RNG.choice(regions)
+        baseline_score = float(np.clip(RNG.normal(50, 12), 20, 85))
+        socio_index = float(np.clip(RNG.normal(0.5, 0.2), 0, 1))
+        avg_class_size = int(np.clip(RNG.integers(15, 45), 10, 60))
+        teacher_exp = float(np.clip(RNG.normal(6, 4), 0, 30))
+        prev_intervention = RNG.choice([0,1], p=[0.7,0.3])
+
+        responsiveness = (
+            0.6 * (1 - socio_index) +
+            0.4 * (80 - baseline_score) / 80 +
+            RNG.normal(0,0.05)
+        )
+        responsiveness = float(np.clip(responsiveness, 0, 1))
+
+        data.append({
+            "school_id": school_id,
+            "region": region,
+            "baseline_score": baseline_score,
+            "socio_index": socio_index,
+            "avg_class_size": avg_class_size,
+            "teacher_exp": teacher_exp,
+            "prev_intervention": prev_intervention,
+            "true_responsiveness": responsiveness
+        })
+
+    return pd.DataFrame(data)
+
+df_units = generate_synthetic_population(200)
+print("Sample units:")
+print(df_units.head())
+
+# ---------------------------------------------------
+# 2. SIMULATE HISTORICAL INTERVENTIONS & OUTCOMES
+# ---------------------------------------------------
+INTERVENTIONS = {
+    "tutor": {"cost": 3000, "effect": 0.25},
+    "devices": {"cost": 1500, "effect": 0.12},
+    "training": {"cost": 2000, "effect": 0.18}
+}
+
+def simulate_historical(df):
+    rows = []
+    for _, r in df.iterrows():
+        intervention = RNG.choice([None,"tutor","devices","training"], p=[0.5,0.2,0.2,0.1])
+
+        if intervention is None:
+            observed_gain = RNG.normal(0.01,0.02)
+        else:
+            eff = INTERVENTIONS[intervention]["effect"]
+            observed_gain = r["true_responsiveness"] * eff + RNG.normal(0,0.02)
+
+        observed_gain = float(np.clip(observed_gain, -0.05, 0.6))
+
+        rows.append({
+            **r.to_dict(),
+            "historical_intervention": intervention if intervention else "none",
+            "observed_gain": observed_gain
+        })
+
+    return pd.DataFrame(rows)
+
+df_obs = simulate_historical(df_units)
+print("\nHistorical sample:")
+print(df_obs[["school_id","historical_intervention","observed_gain"]].head())
+
+# ---------------------------------------------------
+# 3. TRAIN PREDICTIVE MODEL
+# ---------------------------------------------------
+def make_training_rows(df_obs):
+    rows = []
+    for _, r in df_obs.iterrows():
+        for it in ["none"] + list(INTERVENTIONS.keys()):
+            if r["historical_intervention"] == it:
+                label = r["observed_gain"]
+            else:
+                if it == "none":
+                    label = RNG.normal(0.01,0.02)
+                else:
+                    eff = INTERVENTIONS[it]["effect"]
+                    label = r["true_responsiveness"] * eff + RNG.normal(0,0.02)
+                label = float(np.clip(label, -0.05, 0.6))
+
+            rows.append({
+                "school_id": r["school_id"],
+                "region": r["region"],
+                "baseline_score": r["baseline_score"],
+                "socio_index": r["socio_index"],
+                "avg_class_size": r["avg_class_size"],
+                "teacher_exp": r["teacher_exp"],
+                "prev_intervention": r["prev_intervention"],
+                "intervention": it,
+                "label_gain": label
+            })
+    return pd.DataFrame(rows)
+
+df_train = make_training_rows(df_obs)
+df_train = pd.get_dummies(df_train, columns=["intervention"], prefix="intv")
+
+feature_cols = [
+    "baseline_score","socio_index","avg_class_size",
+    "teacher_exp","prev_intervention"
+] + [c for c in df_train.columns if c.startswith("intv_")]
+
+X = df_train[feature_cols]
+y = df_train["label_gain"]
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+model = RandomForestRegressor(
+    n_estimators=200,
+    max_depth=8,
+    random_state=42
+)
+model.fit(X_train, y_train)
+preds = model.predict(X_test)
+
+# MANUAL RMSE (compatible with all sklearn versions)
+mse = mean_squared_error(y_test, preds)
+rmse = mse ** 0.5
+
+print("\nModel RMSE:", round(rmse, 6))
+
+# ---------------------------------------------------
+# 4. PREDICT EXPECTED GAIN FOR CURRENT DECISIONS
+# ---------------------------------------------------
+def predict_expected_gain(df_units, model):
+    rows = []
+    for _, r in df_units.iterrows():
+        for it in list(INTERVENTIONS.keys()):
+            feat = {
+                "baseline_score": r["baseline_score"],
+                "socio_index": r["socio_index"],
+                "avg_class_size": r["avg_class_size"],
+                "teacher_exp": r["teacher_exp"],
+                "prev_intervention": r["prev_intervention"],
+                "intv_none": 0,
+                "intv_devices": 1 if it=="devices" else 0,
+                "intv_tutor": 1 if it=="tutor" else 0,
+                "intv_training": 1 if it=="training" else 0,
+            }
+            Xrow = np.array([feat[c] for c in feature_cols]).reshape(1,-1)
+            pred_gain = float(model.predict(Xrow)[0])
+
+            rows.append({
+                "school_id": r["school_id"],
+                "region": r["region"],
+                "intervention": it,
+                "pred_gain": max(0.0, pred_gain),
+                "cost": INTERVENTIONS[it]["cost"]
+            })
+
+    return pd.DataFrame(rows)
+
+df_pred = predict_expected_gain(df_units, model)
+
+print("\nPredictions sample:")
+print(df_pred.head())
+
+# ---------------------------------------------------
+# 5. ALLOCATION OPTIMIZATION
+# ---------------------------------------------------
+TOTAL_BUDGET = 200000
+MIN_REGIONAL_SHARE = 0.15
+MAX_INTERVENTIONS_PER_SCHOOL = 1
+
+schools = df_units["school_id"].tolist()
+interventions = list(INTERVENTIONS.keys())
+pred_map = df_pred.set_index(["school_id","intervention"])["pred_gain"].to_dict()
+cost_map = df_pred.set_index(["school_id","intervention"])["cost"].to_dict()
+region_map = df_units.set_index("school_id")["region"].to_dict()
+
+prob = pulp.LpProblem("EDU_ALLOCATION", pulp.LpMaximize)
+
+x = pulp.LpVariable.dicts("x", (schools, interventions), 0, 1, cat="Binary")
+
+# objective
+prob += pulp.lpSum(pred_map[(s,it)] * x[s][it] for s in schools for it in interventions)
+
+# budget
+prob += pulp.lpSum(cost_map[(s,it)] * x[s][it] for s in schools for it in interventions) <= TOTAL_BUDGET
+
+# 1 intervention max per school
+for s in schools:
+    prob += pulp.lpSum(x[s][it] for it in interventions) <= MAX_INTERVENTIONS_PER_SCHOOL
+
+# regional fairness
+regions = df_units["region"].unique().tolist()
+for reg in regions:
+    schools_in_reg = [s for s in schools if region_map[s] == reg]
+    prob += pulp.lpSum(cost_map[(s,it)] * x[s][it] 
+                       for s in schools_in_reg for it in interventions) \
+            >= MIN_REGIONAL_SHARE * TOTAL_BUDGET
+
+# optional: limit tutors
+prob += pulp.lpSum([x[s]["tutor"] for s in schools]) <= 40
+
+print("\nSolving optimization…")
+prob.solve(pulp.PULP_CBC_CMD(msg=False))
+
+print("Status:", pulp.LpStatus[prob.status])
+
+# collect output
+alloc = []
+total_cost = 0
+total_gain = 0
+
+for s in schools:
+    for it in interventions:
+        v = pulp.value(x[s][it])
+        if v is not None and v > 0.5:
+            g = pred_map[(s,it)]
+            c = cost_map[(s,it)]
+            alloc.append({
+                "school_id": s,
+                "region": region_map[s],
+                "intervention": it,
+                "pred_gain": g,
+                "cost": c
+            })
+            total_cost += c
+            total_gain += g
+
+alloc_df = pd.DataFrame(alloc).sort_values(
+    ["region","pred_gain"], ascending=[True,False]
+).reset_index(drop=True)
+
+print("\nAllocation sample:")
+print(alloc_df.head(20))
+
+print(f"\nTotal cost allocated: ${total_cost:,.2f}")
+print(f"Total expected gain: {total_gain:.4f}")
+
+# save outputs
+os.makedirs("outputs", exist_ok=True)
+alloc_df.to_csv("outputs/allocation_plan.csv", index=False)
+df_pred.to_csv("outputs/predictions.csv", index=False)
+df_units.to_csv("outputs/units.csv", index=False)
+
+print("\nSaved outputs to ./outputs/")
